@@ -1,0 +1,39 @@
+pen2pro-v2/
+  backend/
+    runtime.txt
+    requirements.txt
+    server.py
+    README.md
+
+    core/
+      __init__.py
+      config.py
+      security.py
+
+    db/
+      __init__.py
+      mongo.py
+
+    models/
+      __init__.py
+      pricing.py
+      users.py
+      marketplace.py
+
+    services/
+      __init__.py
+      pricing_service.py
+      founder_service.py
+      task_service.py
+      partner_service.py
+      payout_service.py
+      stripe_service.py
+
+    routes/
+      __init__.py
+      health.py
+      pricing.py
+      founders.py
+      partners.py
+      marketplace.py
+      stripe_webhooks.py
