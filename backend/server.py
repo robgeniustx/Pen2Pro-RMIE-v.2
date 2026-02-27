@@ -4,6 +4,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 from db.mongo import get_client
 
+from routes.stripe_webhook import router as stripe_webhook_router
 from routes.health import router as health_router
 from routes.pricing import router as pricing_router
 from routes.founders import router as founders_router
