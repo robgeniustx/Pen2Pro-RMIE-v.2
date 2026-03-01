@@ -10,7 +10,6 @@ from routes.pricing import router as pricing_router
 from routes.founders import router as founders_router
 from routes.partners import router as partners_router
 from routes.marketplace import router as marketplace_router
-from routes.billing import router as billing_router
 from routes.stripe_webhooks import router as stripe_webhook_router
 
 logging.basicConfig(level=logging.INFO)
