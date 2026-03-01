@@ -1,48 +1,18 @@
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, EmailStr
-from typing import Optional
+from fastapi import APIRouter, Body
+from services.billing_service import create_checkout_session
 
-from services.billing_service import (
-    create_checkout_for_tier,
-    create_founder_upgrade_checkout,
-)
-
-router = APIRouter(prefix="/api/billing", tags=["billing"])
-
-
-class TierCheckoutRequest(BaseModel):
-    tier: str
-    user_id: str
-    email: EmailStr
-    origin_url: Optional[str] = None
-
-
-class FounderUpgradeCheckoutRequest(BaseModel):
-    user_id: str
-    target_tier: str  # growth_operator or venture_architect
-    origin_url: Optional[str] = None
-
+router = APIRouter(prefix="/billing", tags=["billing"])
 
 @router.post("/checkout")
-async def checkout(req: TierCheckoutRequest):
-    result = await create_checkout_for_tier(
-        tier=req.tier,
-        user_id=req.user_id,
-        email=req.email,
-        origin_url=req.origin_url,
+async def checkout(payload: dict = Body(...)):
+    # Expected payload keys (adjust to your frontend):
+    # plan, user_id, email, origin_url(optional), intent_id(optional), customer_id(optional), ref_id(optional)
+    return await create_checkout_session(
+        plan=payload["plan"],
+        user_id=payload["user_id"],
+        email=payload["email"],
+        origin_url=payload.get("origin_url"),
+        intent_id=payload.get("intent_id"),
+        customer_id=payload.get("customer_id"),
+        ref_id=payload.get("ref_id"),
     )
-    if not result.get("success"):
-        raise HTTPException(status_code=400, detail=result.get("error", "Checkout failed"))
-    return result
-
-
-@router.post("/founder-upgrade-checkout")
-async def founder_upgrade_checkout(req: FounderUpgradeCheckoutRequest):
-    result = await create_founder_upgrade_checkout(
-        user_id=req.user_id,
-        target_tier=req.target_tier,
-        origin_url=req.origin_url,
-    )
-    if not result.get("success"):
-        raise HTTPException(status_code=400, detail=result.get("error", "Upgrade checkout failed"))
-    return result
