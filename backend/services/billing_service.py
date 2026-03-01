@@ -1,209 +1,183 @@
-import uuid
-from typing import Dict, Any, Optional
+from __future__ import annotations
+
+import os
+import hashlib
+from typing import Any, Dict, Optional
+
 import stripe
 
 from core.config import (
-    STRIPE_SECRET_KEY,
     FRONTEND_URL,
-    env_optional,
+    STRIPE_API_KEY,
+    STRIPE_PRICE_PRO_MONTHLY,
+    STRIPE_PRICE_ELITE_MONTHLY,
+    STRIPE_PRICE_LAUNCH_AUTHORITY,
+    STRIPE_PRICE_GROWTH_OPERATOR,
+    STRIPE_PRICE_VENTURE_ARCHITECT,
 )
-from services.pricing_service import PRICING
-from db.mongo import get_db
-from services.founder_service import compute_upgrade_due
 
-stripe.api_key = STRIPE_SECRET_KEY
+# If you store checkout intents in Mongo, keep this import.
+# If your project uses a different DB accessor, replace accordingly.
+from db.mongo import get_client
 
-SUCCESS_PATH = env_optional("STRIPE_CHECKOUT_SUCCESS_PATH", "/billing/success")
-CANCEL_PATH = env_optional("STRIPE_CHECKOUT_CANCEL_PATH", "/billing/cancel")
+
+stripe.api_key = STRIPE_API_KEY
+
+
+def _idempotency_key(prefix: str, seed: str | None = None) -> str:
+    """
+    Deterministic-ish idempotency key to prevent duplicate Stripe objects.
+    You can pass a unique seed (e.g., intent_id, user_id, etc.).
+    """
+    raw = f"{prefix}:{seed or os.urandom(16).hex()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _success_url(origin_url: Optional[str] = None) -> str:
     base = (origin_url or FRONTEND_URL).rstrip("/")
-    return f"{base}{SUCCESS_PATH}?session_id={{CHECKOUT_SESSION_ID}}"
+    return f"{base}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
 
 
 def _cancel_url(origin_url: Optional[str] = None) -> str:
     base = (origin_url or FRONTEND_URL).rstrip("/")
-    return f"{base}{CANCEL_PATH}"
+    return f"{base}/billing/cancel"
 
 
-def _idempotency_key(prefix: str) -> str:
-    return f"{prefix}_{uuid.uuid4().hex}"
+def _price_id_for_plan(plan: str) -> str:
+    plan = (plan or "").strip().lower()
+
+    if plan == "pro":
+        if not STRIPE_PRICE_PRO_MONTHLY:
+            raise ValueError("STRIPE_PRICE_PRO_MONTHLY not set")
+        return STRIPE_PRICE_PRO_MONTHLY
+
+    if plan == "elite":
+        if not STRIPE_PRICE_ELITE_MONTHLY:
+            raise ValueError("STRIPE_PRICE_ELITE_MONTHLY not set")
+        return STRIPE_PRICE_ELITE_MONTHLY
+
+    if plan == "launch_authority":
+        if not STRIPE_PRICE_LAUNCH_AUTHORITY:
+            raise ValueError("STRIPE_PRICE_LAUNCH_AUTHORITY not set")
+        return STRIPE_PRICE_LAUNCH_AUTHORITY
+
+    if plan == "growth_operator":
+        if not STRIPE_PRICE_GROWTH_OPERATOR:
+            raise ValueError("STRIPE_PRICE_GROWTH_OPERATOR not set")
+        return STRIPE_PRICE_GROWTH_OPERATOR
+
+    if plan == "venture_architect":
+        if not STRIPE_PRICE_VENTURE_ARCHITECT:
+            raise ValueError("STRIPE_PRICE_VENTURE_ARCHITECT not set")
+        return STRIPE_PRICE_VENTURE_ARCHITECT
+
+    raise ValueError(f"Unknown plan: {plan}")
 
 
-async def create_checkout_for_tier(
+def _mode_for_plan(plan: str) -> str:
+    """
+    Return Stripe Checkout mode: 'subscription' for monthly plans, 'payment' for one-time.
+    """
+    plan = (plan or "").strip().lower()
+    if plan in {"pro", "elite"}:
+        return "subscription"
+    if plan in {"launch_authority", "growth_operator", "venture_architect"}:
+        return "payment"
+    raise ValueError(f"Unknown plan: {plan}")
+
+
+async def create_checkout_session(
     *,
-    tier: str,
+    plan: str,
     user_id: str,
     email: str,
     origin_url: Optional[str] = None,
+    intent_id: Optional[str] = None,
+    customer_id: Optional[str] = None,
+    ref_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Creates Stripe Checkout Session for:
-      - subscription tiers (pro, elite) using configured price IDs
-      - founder one-time tiers using configured price IDs
+    Creates a Stripe Checkout Session and stores a lightweight record (optional) in Mongo.
+
+    Parameters you likely already have:
+      - plan: 'pro'|'elite'|'launch_authority'|'growth_operator'|'venture_architect'
+      - user_id/email: who is checking out
+      - origin_url: frontend base (optional); defaults to FRONTEND_URL
+      - intent_id: your internal checkout intent id (optional)
+      - customer_id: existing Stripe customer id (optional)
+      - ref_id: client_reference_id (optional)
     """
-    if tier not in PRICING:
-        return {"success": False, "error": f"Unknown tier: {tier}"}
+    price_id = _price_id_for_plan(plan)
+    mode = _mode_for_plan(plan)
 
-    tinfo = PRICING[tier]
-    mode = tinfo["mode"]
+    success_url = _success_url(origin_url)
+    cancel_url = _cancel_url(origin_url)
 
-    price_id = tinfo.get("stripe_price_id")
-    if mode in ("subscription", "payment") and not price_id:
-        return {"success": False, "error": f"Stripe price_id not configured for tier: {tier}"}
+    # Stripe expects line_items list in a consistent format
+    line_items = [{"price": price_id, "quantity": 1}]
 
-    metadata = {
-        "tier": tier,
+    metadata: Dict[str, Any] = {
+        "plan": plan,
         "user_id": user_id,
         "email": email,
-        "product": "pen2pro_v2",
-    }
-
-    # record intent in DB (optional but helpful)
-    db = get_db()
-    intent_id = f"intent_{uuid.uuid4().hex[:12]}"
-    await db.checkout_intents.insert_one({
-        "id": intent_id,
-        "tier": tier,
-        "mode": mode,
-        "user_id": user_id,
-        "email": email,
-        "origin_url": origin_url or FRONTEND_URL,
+        "origin_url": (origin_url or FRONTEND_URL),
         "status": "created",
-        "created_at": __import__("datetime").datetime.utcnow().isoformat(),
-    })
-    metadata["intent_id"] = intent_id
+    }
+    if intent_id:
+        metadata["intent_id"] = intent_id
 
+    # Create Stripe Checkout Session (single, correct call; no duplicate kwargs)
     try:
         session = stripe.checkout.Session.create(
-            mode=("subscription" if mode == "subscription" else "payment"),
+            mode=mode,
             customer_email=email,
-            line_items=[{"price": price_id, "quantity": 1}],
-            success_url=_success_url(origin_url),
-            cancel_url=_cancel_url(origin_url),
+            line_items=line_items,
+            success_url=success_url,
+            cancel_url=cancel_url,
+            customer=customer_id,
+            client_reference_id=ref_id,
             metadata=metadata,
-            allow_promotion_codes=True if mode == "subscription" else False,
-        , idempotency_key=_idempotency_key("co"))
-    except TypeError:
-        # Some stripe versions don't accept idempotency_key kwarg on create;
-        # fallback without it.
-        session = stripe.checkout.Session.create(
-            mode=("subscription" if mode == "subscription" else "payment"),
-            customer_email=email,
-            line_items=[{"price": price_id, "quantity": 1}],
-            success_url=_success_url(origin_url),
-            cancel_url=_cancel_url(origin_url),
-            metadata=metadata,
-            allow_promotion_codes=True if mode == "subscription" else False,
+            idempotency_key=_idempotency_key("co", seed=intent_id or ref_id or user_id),
         )
-
-    await db.checkout_intents.update_one(
-        {"id": intent_id},
-        {"$set": {"status": "session_created", "stripe_session_id": session.id}}
-    )
-
-    return {"success": True, "session_id": session.id, "checkout_url": session.url}
-
-
-async def create_founder_upgrade_checkout(
-    *,
-    user_id: str,
-    target_tier: str,
-    origin_url: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Founder upgrade checkout with 1-year credit applied.
-    Charges ONLY the due amount (difference) using price_data (no extra Stripe Prices needed).
-    """
-    if target_tier not in ("growth_operator", "venture_architect"):
-        return {"success": False, "error": "target_tier must be growth_operator or venture_architect"}
-
-    db = get_db()
-    founder = await db.founders.find_one({"user_id": user_id}, {"_id": 0})
-    if not founder:
-        return {"success": False, "error": "Founder record not found for user"}
-
-    quote = await compute_upgrade_due(founder, target_tier)
-    due_cents = int(quote["due_cents"])
-    if due_cents <= 0:
-        return {"success": False, "error": "No payment due (already covered by credit or same tier)"}
-
-    email = founder.get("email", "")
-
-    metadata = {
-        "tier": target_tier,
-        "user_id": user_id,
-        "email": email,
-        "product": "pen2pro_v2",
-        "upgrade_from": founder.get("tier"),
-        "upgrade_credit_cents": str(int(quote["credit_cents"])),
-        "upgrade_due_cents": str(due_cents),
-        "upgrade": "true",
-    }
-
-    # record upgrade intent
-    intent_id = f"upg_{uuid.uuid4().hex[:12]}"
-    await db.checkout_intents.insert_one({
-        "id": intent_id,
-        "type": "founder_upgrade",
-        "from_tier": founder.get("tier"),
-        "to_tier": target_tier,
-        "user_id": user_id,
-        "email": email,
-        "credit_cents": int(quote["credit_cents"]),
-        "due_cents": due_cents,
-        "status": "created",
-        "created_at": __import__("datetime").datetime.utcnow().isoformat(),
-    })
-    metadata["intent_id"] = intent_id
-
-    # Use price_data so you can charge the difference without creating extra Prices in Stripe
-    try:
-        session = stripe.checkout.Session.create(
-            mode="payment",
-            customer_email=email,
-            line_items=[{
-                "price_data": {
-                    "currency": "usd",
-                    "product_data": {
-                        "name": f"PEN2PRO Founder Upgrade → {PRICING[target_tier]['name']}",
-                    },
-                    "unit_amount": due_cents,
-                },
-                "quantity": 1
-            }],
-            success_url=_success_url(origin_url),
-            cancel_url=_cancel_url(origin_url),
-            metadata=metadata,
-        , idempotency_key=_idempotency_key("upg"))
     except TypeError:
+        # Some Stripe versions don't accept idempotency_key kwarg on create; fallback.
         session = stripe.checkout.Session.create(
-            mode="payment",
+            mode=mode,
             customer_email=email,
-            line_items=[{
-                "price_data": {
-                    "currency": "usd",
-                    "product_data": {
-                        "name": f"PEN2PRO Founder Upgrade → {PRICING[target_tier]['name']}",
-                    },
-                    "unit_amount": due_cents,
-                },
-                "quantity": 1
-            }],
-            success_url=_success_url(origin_url),
-            cancel_url=_cancel_url(origin_url),
+            line_items=line_items,
+            success_url=success_url,
+            cancel_url=cancel_url,
+            customer=customer_id,
+            client_reference_id=ref_id,
             metadata=metadata,
         )
 
-    await db.checkout_intents.update_one(
-        {"id": intent_id},
-        {"$set": {"status": "session_created", "stripe_session_id": session.id}}
-    )
+    # Optional: store/update a checkout intent record in Mongo if you have that collection.
+    # If your DB schema differs, adjust or remove this block safely.
+    if intent_id:
+        client = get_client()
+        db = client.get_default_database()
+
+        await db.checkout_intents.update_one(
+            {"id": intent_id},
+            {
+                "$set": {
+                    "status": "session_created",
+                    "stripe_session_id": session.id,
+                    "stripe_session_url": getattr(session, "url", None),
+                    "plan": plan,
+                    "mode": mode,
+                    "user_id": user_id,
+                    "email": email,
+                    "origin_url": (origin_url or FRONTEND_URL),
+                }
+            },
+            upsert=True,
+        )
 
     return {
-        "success": True,
-        "session_id": session.id,
-        "checkout_url": session.url,
-        "quote": quote,
+        "id": session.id,
+        "url": getattr(session, "url", None),
+        "mode": mode,
+        "price_id": price_id,
     }
