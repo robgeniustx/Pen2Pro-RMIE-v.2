@@ -7,6 +7,7 @@ from db.mongo import get_client
 # Routers
 from routes.health import router as health_router
 from routes.pricing import router as pricing_router
+from routes.billing import router as billing_router
 from routes.stripe_webhook import router as stripe_webhook_router
 
 logging.basicConfig(level=logging.INFO)
