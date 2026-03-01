@@ -28,7 +28,6 @@ PRICING: Dict[str, Dict[str, Any]] = {
         "stripe_price_id": STRIPE_PRICE_ELITE_MONTHLY,
         "features": ["Execution Architect GPT", "Affiliate Monetization GPT", "Preferred marketplace pricing"],
     },
-    # Founder one-time tiers
     "launch_authority": {
         "name": "Launch Authority",
         "mode": "payment",
@@ -54,3 +53,7 @@ PRICING: Dict[str, Dict[str, Any]] = {
         "features": ["Trademark routed", "White-glove onboarding", "Investor-ready docs", "Venture Scale GPT"],
     },
 }
+
+
+def get_pricing_data() -> Dict[str, Dict[str, Any]]:
+    return PRICING
